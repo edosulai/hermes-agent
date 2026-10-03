@@ -1,7 +1,8 @@
 """1Password Login items as a vault backend (``op`` CLI).
 
-Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
-integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
+Unlock: ``op signin --raw`` with the master password on stdin mints an
+``OP_SESSION_<account>`` token. With desktop-app integration it prints nothing
+(the app authorizes each call); ``op whoami`` confirms and no token is exported.
 A configured service-account token skips the prompt entirely (headless).
 List: ``op item list --categories Login --format json`` → title, urls,
 username. Resolve: ``op item get <id> --fields label=password --reveal``.
@@ -25,6 +26,9 @@ from agent.vault_store import VaultItemMeta, normalize_origin
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+# Stored in place of a session token when the desktop app authorizes each `op` call itself
+# (app integration: `op signin --raw` exits 0 and prints nothing). Never exported as OP_SESSION.
+_APP_INTEGRATION = "\x00app-integration"
 
 
 class OnePasswordLoginBackend(LoginBackend):
@@ -61,7 +65,7 @@ class OnePasswordLoginBackend(LoginBackend):
             env["OP_ACCOUNT"] = account
         if self._service_token:
             env["OP_SERVICE_ACCOUNT_TOKEN"] = self._service_token
-        elif session_token:
+        elif session_token and session_token != _APP_INTEGRATION:
             # op signin --raw prints the bare token; the env var name carries the account shorthand,
             # which op also accepts as plain OP_SESSION for the default account.
             env[f"OP_SESSION_{account}" if account else "OP_SESSION"] = session_token
@@ -78,10 +82,18 @@ class OnePasswordLoginBackend(LoginBackend):
             cmd += ["--account", account]
         proc = run_with_stdin_secret(cmd, env=self._env(None), secret=master_password, timeout=_TIMEOUT, label="op")
         token = (proc.stdout or "").strip()
+        if proc.returncode == 0 and not token and self._app_integration_active():
+            token = _APP_INTEGRATION
         if proc.returncode != 0 or not token:
             raise RuntimeError(f"1Password unlock failed: {_scrub(proc.stderr or '')[:200] or 'no session token'}")
         if not _unlock.store_session_token(self.name, token, generation):
             raise RuntimeError("1Password was locked while unlocking; try again")
+
+    def _app_integration_active(self) -> bool:
+        """Desktop-app integration mints no token; `op whoami` confirms the app authorizes calls."""
+        proc = run_cli([str(self._op()), "whoami"], env=self._env(None), timeout=_TIMEOUT, label="op",
+                       timeout_message="op timed out", stdin=subprocess.DEVNULL)
+        return proc.returncode == 0
 
     def _run(self, *args: str) -> str:
         token = None if self._service_token else _unlock.get_session_token(self.name)

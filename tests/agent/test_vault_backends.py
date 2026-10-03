@@ -231,3 +231,64 @@ def test_onepassword_backend_env_forwards_config_directory(monkeypatch):
     backend = OnePasswordLoginBackend({"enabled": True})
 
     assert backend._env(None)["OP_CONFIG_DIR"] == "/tmp/op-config"
+
+
+def _op_backend(monkeypatch):
+    from agent.vault_backends import onepassword as op_mod
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    backend = op_mod.OnePasswordLoginBackend({"enabled": True})
+    backend._service_token = ""
+    monkeypatch.setattr(backend, "_op", lambda: "/fake/op")
+    unlock_mod.lock(backend.name)
+    return op_mod, backend
+
+
+def _proc(rc=0, out="", err=""):
+    import subprocess
+    return subprocess.CompletedProcess([], rc, out, err)
+
+
+def test_onepassword_app_integration_unlock_without_session_token(monkeypatch):
+    """Desktop-app integration: `op signin --raw` exits 0 with no token; `op whoami` confirms,
+    the backend counts as unlocked and later calls carry no OP_SESSION."""
+    op_mod, backend = _op_backend(monkeypatch)
+    calls = []
+
+    def fake_run_cli(cmd, env=None, **kw):
+        calls.append((cmd, env))
+        return _proc(0, "[]" if cmd[1] != "whoami" else "user")
+
+    monkeypatch.setattr(op_mod, "run_with_stdin_secret", lambda *a, **kw: _proc(0, ""))
+    monkeypatch.setattr(op_mod, "run_cli", fake_run_cli)
+    try:
+        backend.unlock("pw")
+        assert backend.is_unlocked()
+        assert backend._run("item", "list") == "[]"
+        assert calls[0][0][1:] == ["whoami"]
+        assert not any(k.startswith("OP_SESSION") for k in calls[-1][1])
+    finally:
+        unlock_mod.lock(backend.name)
+
+
+def test_onepassword_empty_signin_and_whoami_failure_still_errors(monkeypatch):
+    op_mod, backend = _op_backend(monkeypatch)
+    monkeypatch.setattr(op_mod, "run_with_stdin_secret", lambda *a, **kw: _proc(0, ""))
+    monkeypatch.setattr(op_mod, "run_cli", lambda *a, **kw: _proc(1, "", "not signed in"))
+    with pytest.raises(RuntimeError, match="no session token"):
+        backend.unlock("pw")
+    assert not backend.is_unlocked()
+
+
+def test_onepassword_session_token_unlock_unchanged(monkeypatch):
+    op_mod, backend = _op_backend(monkeypatch)
+    envs = []
+    monkeypatch.setattr(op_mod, "run_with_stdin_secret", lambda *a, **kw: _proc(0, "tok123\n"))
+    monkeypatch.setattr(op_mod, "run_cli", lambda cmd, env=None, **kw: envs.append((cmd, env)) or _proc(0, "[]"))
+    try:
+        backend.unlock("pw")
+        assert backend.is_unlocked()
+        backend._run("item", "list")
+        assert [c[1:] for c, _ in envs] == [["item", "list"]]  # no whoami probe on the token path
+        assert envs[0][1]["OP_SESSION"] == "tok123"
+    finally:
+        unlock_mod.lock(backend.name)
